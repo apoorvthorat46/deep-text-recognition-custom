@@ -10,7 +10,7 @@ from natsort import natsorted
 from PIL import Image
 import numpy as np
 from torch.utils.data import Dataset, ConcatDataset, Subset
-from torch._utils import _accumulate
+from itertools import accumulate as _accumulate
 import torchvision.transforms as transforms
 
 
@@ -52,9 +52,9 @@ class Batch_Balanced_Dataset(object):
             dataset_split = [number_dataset, total_number_dataset - number_dataset]
             indices = range(total_number_dataset)
             _dataset, _ = [Subset(_dataset, indices[offset - length:offset])
-                           for offset, length in zip(_accumulate(dataset_split), dataset_split)]
+                            for offset, length in zip(_accumulate(dataset_split), dataset_split)]
             selected_d_log = f'num total samples of {selected_d}: {total_number_dataset} x {opt.total_data_usage_ratio} (total_data_usage_ratio) = {len(_dataset)}\n'
-            selected_d_log += f'num samples of {selected_d} per batch: {opt.batch_size} x {float(batch_ratio_d)} (batch_ratio) = {_batch_size}'
+            selected_d_log += f'num-samples of {selected_d} per batch: {opt.batch_size} x {float(batch_ratio_d)} (batch_ratio) = {_batch_size}'
             print(selected_d_log)
             log.write(selected_d_log + '\n')
             batch_size_list.append(str(_batch_size))
@@ -101,26 +101,41 @@ class Batch_Balanced_Dataset(object):
 
 
 def hierarchical_dataset(root, opt, select_data='/'):
-    """ select_data='/' contains all sub-directory of root directory """
+    """
+    Load datasets directly from the paths given in select_data.
+    This is a simplified version that avoids os.walk.
+    """
     dataset_list = []
     dataset_log = f'dataset_root:    {root}\t dataset: {select_data[0]}'
     print(dataset_log)
     dataset_log += '\n'
-    for dirpath, dirnames, filenames in os.walk(root+'/'):
-        if not dirnames:
-            select_flag = False
-            for selected_d in select_data:
-                if selected_d in dirpath:
-                    select_flag = True
-                    break
 
-            if select_flag:
-                dataset = LmdbDataset(dirpath, opt)
-                sub_dataset_log = f'sub-directory:\t/{os.path.relpath(dirpath, root)}\t num samples: {len(dataset)}'
-                print(sub_dataset_log)
-                dataset_log += f'{sub_dataset_log}\n'
-                dataset_list.append(dataset)
+    # --- NEW SIMPLIFIED LOGIC ---
+    # We will not walk the directory. We will just use the name(s) you gave.
+    for selected_d in select_data:
+        # Construct the full path to the dataset
+        dirpath = os.path.join(os.path.abspath(root), selected_d)
 
+        # Check if this path actually exists
+        if not os.path.isdir(dirpath):
+            print(f"!!!!!!!!!! ERROR: Cannot find dataset folder: {dirpath} !!!!!!!!!!")
+            continue  # Skip this one
+
+        print(f"Found dataset at: {dirpath}")
+        dataset = LmdbDataset(dirpath, opt)
+
+        # Check if the dataset is valid (has samples)
+        if len(dataset) == 0:
+            print(f"!!!!!!!!!! WARNING: Dataset at {dirpath} has 0 samples. Skipping. !!!!!!!!!!")
+            continue  # Skip this one
+
+        sub_dataset_log = f'sub-directory:\t/{os.path.relpath(dirpath, root)}\t num-samples: {len(dataset)}'
+        print(sub_dataset_log)
+        dataset_log += f'{sub_dataset_log}\n'
+        dataset_list.append(dataset)
+    # --- END NEW LOGIC ---
+
+    # This is the line that was crashing
     concatenated_dataset = ConcatDataset(dataset_list)
 
     return concatenated_dataset, dataset_log
@@ -141,39 +156,28 @@ class LmdbDataset(Dataset):
             nSamples = int(txn.get('num-samples'.encode()))
             self.nSamples = nSamples
 
-            if self.opt.data_filtering_off:
-                # for fast check or benchmark evaluation with no filtering
-                self.filtered_index_list = [index + 1 for index in range(self.nSamples)]
-            else:
-                """ Filtering part
-                If you want to evaluate IC15-2077 & CUTE datasets which have special character labels,
-                use --data_filtering_off and only evaluate on alphabets and digits.
-                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/6593928855fb7abb999a99f428b3e4477d4ae356/dataset.py#L190-L192
+            self.filtered_index_list = []
+            for index in range(self.nSamples):
+                index += 1  # lmdb starts with 1
+                label_key = 'label-%09d'.encode() % index
+                label = txn.get(label_key).decode('utf-8')
 
-                And if you want to evaluate them with the model trained with --sensitive option,
-                use --sensitive and --data_filtering_off,
-                see https://github.com/clovaai/deep-text-recognition-benchmark/blob/dff844874dbe9e0ec8c5a52a7bd08c7f20afe704/test.py#L137-L144
-                """
-                self.filtered_index_list = []
-                for index in range(self.nSamples):
-                    index += 1  # lmdb starts with 1
-                    label_key = 'label-%09d'.encode() % index
-                    label = txn.get(label_key).decode('utf-8')
+                # --- ALWAYS CHECK FOR LENGTH ---
+                if len(label) > self.opt.batch_max_length:
+                    print(f'WARNING: Skipping long label (len {len(label)}): {label[:20]}...')
+                    continue
 
-                    if len(label) > self.opt.batch_max_length:
-                        # print(f'The length of the label is longer than max_length: length
-                        # {len(label)}, {label} in dataset {self.root}')
-                        continue
-
+                # --- Conditionally check for characters ---
+                if not self.opt.data_filtering_off:
                     # By default, images containing characters which are not in opt.character are filtered.
                     # You can add [UNK] token to `opt.character` in utils.py instead of this filtering.
                     out_of_char = f'[^{self.opt.character}]'
                     if re.search(out_of_char, label.lower()):
                         continue
 
-                    self.filtered_index_list.append(index)
+                self.filtered_index_list.append(index)
 
-                self.nSamples = len(self.filtered_index_list)
+            self.nSamples = len(self.filtered_index_list)
 
     def __len__(self):
         return self.nSamples

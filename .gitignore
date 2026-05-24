@@ -2,6 +2,10 @@
 **/data_lmdb_release/*
 **/image_release/*
 **/result/*
+output_reports/
+batch_test_reports/
+Single_images_report/
+test_images/
 *.mdb
 *.pth
 *.tar
@@ -11,6 +15,9 @@
 *.zip
 *.eps
 *.pdf
+*.mp4
+*.avi
+*.mov
 
 ### Linux ###
 *~
